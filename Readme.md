@@ -68,48 +68,81 @@ import (
     "net/http"
 )
 
+package main
+
+import (
+	"net/http"
+	"os"
+
+	"github.com/gin-gonic/gin"
+	"github.com/redis/go-redis/v9"
+	"github.com/ibra04-coder/taxi-auth-go"
+)
+
 func main() {
-    // 1. Настраиваем ключи (обычно загружаются из файлов или ENV)
-    publicKeys := map[string]string{
-        "client": "-----BEGIN PUBLIC KEY-----\n...key content...\n-----END PUBLIC KEY-----",
-        "driver": "-----BEGIN PUBLIC KEY-----\n...key content...\n-----END PUBLIC KEY-----",
-    }
+	r := gin.Default()
 
-    // 2. Опционально: Настройка Redis для проверки отзыва токенов
-    rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
-    checker := auth.NewRedisChecker(rdb, "blacklist:") // префикс ключей в Redis
+	// 1. Настройка Redis для проверки отозванных токенов (Blacklist)
+	rdb := redis.NewClient(&redis.Options{
+		Addr: "localhost:6379",
+	})
+	checker := auth.NewRedisChecker(rdb, "blacklist:")
 
-    // 3. Создаем Middleware
-    authMid, err := auth.NewAuthMiddleware(publicKeys, checker)
-    if err != nil {
-        panic(err)
-    }
+	// 2. Загружаем публичные ключи (в реальности лучше читать из .key файлов или ENV)
+	// Ключи должны соответствовать тем, которыми Laravel Passport подписывает токены
+	publicKeys := map[string]string{
+		"client": os.Getenv("CLIENT_PUBLIC_KEY"),
+		"driver": os.Getenv("DRIVER_PUBLIC_KEY"),
+	}
 
-    r := gin.Default()
+	authMid, err := auth.NewAuthMiddleware(publicKeys, checker)
+	if err != nil {
+		panic("Failed to init auth middleware: " + err.Error())
+	}
 
-    // 4. Применяем Middleware к группе роутов
-    protected := r.Group("/api/v1")
-    protected.Use(func(c *gin.Context) {
-        authMid.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-            c.Request = r
-            c.Next()
-        })).ServeHTTP(c.Writer, c.Request)
-    })
+	api := r.Group("/api/v1")
 
-    // 5. Доступ к данным в обработчике
-    protected.GET("/orders", func(c *gin.Context) {
-        userID := auth.GetUserID(c.Request.Context())
-        
-        // Проверка прав (scopes)
-        if !auth.HasScope(c.Request.Context(), "view-orders") {
-            c.JSON(http.StatusForbidden, gin.H{"error": "Insufficient permissions"})
-            return
-        }
+	api.Use(adaptToGin(authMid.Handler))
 
-        c.JSON(200, gin.H{"user_id": userID})
-    })
+	api.GET("/me", func(c *gin.Context) {
+		ctx := c.Request.Context()
+		c.JSON(200, gin.H{
+			"user_id":   auth.GetUserID(ctx),
+			"user_type": auth.GetUserType(ctx),
+			"client_id": auth.GetClientID(ctx),
+		})
+	})
 
-    r.Run(":8080")
+	clientRoutes := api.Group("/client")
+	clientRoutes.Use(adaptToGin(auth.Only("client")))
+	{
+		clientRoutes.GET("/orders", func(c *gin.Context) {
+			c.JSON(200, gin.H{"message": "Список заказов клиента"})
+		})
+	}
+s
+	driverRoutes := api.Group("/driver")
+	driverRoutes.Use(adaptToGin(auth.Only("driver")))
+	{
+		driverRoutes.POST("/status", func(c *gin.Context) {
+			if !auth.HasScope(c.Request.Context(), "update-status") {
+				c.JSON(403, gin.H{"error": "Нет прав для обновления статуса"})
+				return
+			}
+			c.JSON(200, gin.H{"message": "Статус водителя обновлен"})
+		})
+	}
+
+	r.Run(":8080")
+}
+
+func adaptToGin(handler func(http.Handler) http.Handler) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			c.Request = r
+			c.Next()
+		})).ServeHTTP(c.Writer, c.Request)
+	}
 }
 ```
 

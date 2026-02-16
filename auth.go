@@ -14,8 +14,10 @@ import (
 type contextKey string
 
 const (
-	UserIDKey contextKey = "user_id"
-	ScopesKey contextKey = "scopes"
+	UserIDKey   contextKey = "user_id"
+	UserTypeKey contextKey = "user_type"
+	ClientIDKey contextKey = "client_id"
+	ScopesKey   contextKey = "scopes"
 )
 
 type RevocationChecker interface {
@@ -40,7 +42,8 @@ func (r *RedisChecker) IsRevoked(ctx context.Context, jti string) bool {
 }
 
 type CustomClaims struct {
-	Scopes []string `json:"scopes"`
+	Scopes   []string `json:"scopes"`
+	ClientID string   `json:"client_id"`
 	jwt.RegisteredClaims
 }
 
@@ -51,7 +54,6 @@ type AuthMiddleware struct {
 
 func NewAuthMiddleware(keys map[string]string, checker RevocationChecker) (*AuthMiddleware, error) {
 	parsedKeys := make(map[string]*rsa.PublicKey)
-
 	for name, pemStr := range keys {
 		pubKey, err := jwt.ParseRSAPublicKeyFromPEM([]byte(pemStr))
 		if err != nil {
@@ -59,7 +61,6 @@ func NewAuthMiddleware(keys map[string]string, checker RevocationChecker) (*Auth
 		}
 		parsedKeys[name] = pubKey
 	}
-
 	return &AuthMiddleware{
 		publicKeys: parsedKeys,
 		checker:    checker,
@@ -82,21 +83,21 @@ func (m *AuthMiddleware) Handler(next http.Handler) http.Handler {
 
 		tokenString := parts[1]
 		claims := &CustomClaims{}
-		var token *jwt.Token
-		var err error
+		var validToken *jwt.Token
+		var detectedType string
 
-		valid := false
-		for _, pubKey := range m.publicKeys {
-			token, err = jwt.ParseWithClaims(tokenString, claims, func(t *jwt.Token) (interface{}, error) {
+		for keyType, pubKey := range m.publicKeys {
+			token, err := jwt.ParseWithClaims(tokenString, claims, func(t *jwt.Token) (interface{}, error) {
 				return pubKey, nil
 			})
 			if err == nil && token.Valid {
-				valid = true
+				validToken = token
+				detectedType = keyType
 				break
 			}
 		}
 
-		if !valid {
+		if validToken == nil {
 			http.Error(w, "Invalid or expired token", http.StatusUnauthorized)
 			return
 		}
@@ -106,7 +107,10 @@ func (m *AuthMiddleware) Handler(next http.Handler) http.Handler {
 			return
 		}
 
-		ctx := context.WithValue(r.Context(), UserIDKey, claims.Subject)
+		ctx := r.Context()
+		ctx = context.WithValue(ctx, UserIDKey, claims.Subject)
+		ctx = context.WithValue(ctx, UserTypeKey, detectedType)
+		ctx = context.WithValue(ctx, ClientIDKey, claims.ClientID)
 		ctx = context.WithValue(ctx, ScopesKey, claims.Scopes)
 
 		next.ServeHTTP(w, r.WithContext(ctx))
@@ -114,25 +118,41 @@ func (m *AuthMiddleware) Handler(next http.Handler) http.Handler {
 }
 
 func GetUserID(ctx context.Context) string {
-	if id, ok := ctx.Value(UserIDKey).(string); ok {
-		return id
-	}
-	return ""
+	id, _ := ctx.Value(UserIDKey).(string)
+	return id
 }
 
-func GetScopes(ctx context.Context) []string {
-	if scopes, ok := ctx.Value(ScopesKey).([]string); ok {
-		return scopes
-	}
-	return []string{}
+func GetUserType(ctx context.Context) string {
+	uType, _ := ctx.Value(UserTypeKey).(string)
+	return uType
 }
 
-func HasScope(ctx context.Context, required string) bool {
-	scopes := GetScopes(ctx)
+func GetClientID(ctx context.Context) string {
+	id, _ := ctx.Value(ClientIDKey).(string)
+	return id
+}
+
+func HasScope(ctx context.Context, scope string) bool {
+	scopes, _ := ctx.Value(ScopesKey).([]string)
 	for _, s := range scopes {
-		if s == required {
+		if s == scope {
 			return true
 		}
 	}
 	return false
+}
+
+func Only(allowedTypes ...string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			currentType := GetUserType(r.Context())
+			for _, t := range allowedTypes {
+				if t == currentType {
+					next.ServeHTTP(w, r)
+					return
+				}
+			}
+			http.Error(w, "Access denied for this user type", http.StatusForbidden)
+		})
+	}
 }
